@@ -206,18 +206,24 @@ def main():
             buckets_data[bucket_name]['amount'] += parsed['amount']
             total_amount += parsed['amount']
 
+    # Calculate total unique participants across all buckets for percentage calculation
+    total_wallets_sum = sum(len(data['wallets']) for data in buckets_data.values())
+
     # 4. Print summary
     print(f"\nSummary (Last {args.days} days):")
-    print(f"{'Bucket':<15} | {'Wallets':<10} | {'Total Pi':<15} | {'% of Total'}")
-    print("-" * 60)
+    print(f"{'Bucket':<15} | {'Wallets':<10} | {'Wallet %':<10} | {'Total Pi':<15} | {'Pi %'}")
+    print("-" * 75)
     
     ordered_buckets = ["Unlocked", "2 Weeks", "6 Months", "1 Year", "3 Year"]
     for name in ordered_buckets:
         data = buckets_data[name]
         wallet_count = len(data['wallets'])
         amount = data['amount']
-        pct = (amount / total_amount * 100) if total_amount > 0 else 0
-        print(f"{name:<15} | {wallet_count:<10} | {amount:<15.2f} | {pct:>10.2f}%")
+        
+        wallet_pct = (wallet_count / total_wallets_sum * 100) if total_wallets_sum > 0 else 0
+        pi_pct = (amount / total_amount * 100) if total_amount > 0 else 0
+        
+        print(f"{name:<15} | {wallet_count:<10} | {wallet_pct:>8.2f}% | {amount:<15.2f} | {pi_pct:>8.2f}%")
 
 if __name__ == "__main__":
     main()
