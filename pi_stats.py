@@ -1,6 +1,8 @@
 import requests
 import argparse
+import time
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DAY_SEC = 86400
 
@@ -38,7 +40,6 @@ def parse_operation(op_json):
     def to_timestamp(iso_str):
         if not iso_str:
             return None
-        # Handle 'Z' suffix for ISO format strings
         return datetime.fromisoformat(iso_str.replace('Z', '+00:00')).timestamp()
 
     amount = float(op_json.get('amount', 0))
@@ -51,27 +52,19 @@ def parse_operation(op_json):
     try:
         claimants = op_json.get('claimants', [])
         if claimants:
-            # Set default wallet from the first claimant
             wallet = claimants[0].get('destination')
-            
-            # Loop through ALL claimants to find the lockup period ('not' block)
             for claimant in claimants:
                 predicate = claimant.get('predicate', {})
                 not_clause = predicate.get('not', {})
                 if not_clause:
-                    # Found the lockup! Update the wallet and extract info
                     wallet = claimant.get('destination')
-                    
                     rel_before_val = not_clause.get('rel_before')
                     if rel_before_val is not None:
                         rel_before_sec = int(rel_before_val)
-                    
                     if rel_before_sec is None:
                         abs_before_str = not_clause.get('abs_before')
                         if abs_before_str:
                             abs_before_ts = to_timestamp(abs_before_str)
-                    
-                    # Break once the 'not' block is found
                     break
     except (AttributeError, KeyError, ValueError):
         pass
@@ -85,22 +78,49 @@ def parse_operation(op_json):
     return {
         'amount': amount,
         'created_at': created_at_ts,
-        'abs_before': abs_before_ts,
-        'rel_before': rel_before_sec,
         'duration': duration,
         'wallet': wallet
     }
 
-def fetch_data_for_days(wallet_address, days):
-    """
-    Fetches all operations for the wallet address in the specified number of days.
-    Uses the Horizon API and handles pagination.
-    """
-    url = f"https://api.mainnet.minepi.com/accounts/{wallet_address}/operations?order=desc&limit=200"
-    all_ops = []
-    now_ts = datetime.now(timezone.utc).timestamp()
-    cutoff_ts = now_ts - (days * DAY_SEC)
+def get_latest_ledger():
+    url = "https://api.mainnet.minepi.com/ledgers?order=desc&limit=1"
+    response = requests.get(url)
+    response.raise_for_status()
+    data = response.json()
+    record = data['_embedded']['records'][0]
+    return {
+        'sequence': record['sequence'],
+        'closed_at': datetime.fromisoformat(record['closed_at'].replace('Z', '+00:00')).timestamp()
+    }
 
+def get_ledger_boundary_cursor(target_ts, latest_ledger):
+    # Estimate ledger sequence (Pi Network: ~5.1s per ledger)
+    diff_sec = latest_ledger['closed_at'] - target_ts
+    est_seq = latest_ledger['sequence'] - int(diff_sec / 5.1)
+    
+    # Refine the sequence to be closer to target_ts
+    try:
+        url = f"https://api.mainnet.minepi.com/ledgers/{est_seq}"
+        resp = requests.get(url)
+        resp.raise_for_status()
+        l_data = resp.json()
+        seq = l_data['sequence']
+    except:
+        seq = est_seq
+    
+    # Return cursor for (seq + 1) which is a boundary including all ops in 'seq'
+    return (seq + 1) << 32
+
+def fetch_data_chunk(wallet_address, start_cursor, end_cursor):
+    """
+    Fetches operations from start_cursor down to end_cursor (exclusive).
+    """
+    base_url = f"https://api.mainnet.minepi.com/accounts/{wallet_address}/operations?order=desc&limit=200"
+    url = base_url
+    if start_cursor:
+        url += f"&cursor={start_cursor}"
+    
+    all_ops = []
     while url:
         try:
             response = requests.get(url)
@@ -112,33 +132,62 @@ def fetch_data_for_days(wallet_address, days):
                 break
                 
             for op in records:
-                created_at_str = op.get('created_at')
-                # Reuse the timestamp conversion logic
-                dt = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
-                created_at_ts = dt.timestamp()
-                
-                if created_at_ts < cutoff_ts:
-                    return all_ops # Stop fetching as per specified time window
-                
+                op_id = int(op['id'])
+                if end_cursor and op_id <= end_cursor:
+                    return all_ops
                 all_ops.append(op)
             
             url = data.get('_links', {}).get('next', {}).get('href')
         except requests.exceptions.RequestException as e:
-            print(f"Error fetching data: {e}")
+            print(f"Error fetching chunk: {e}")
             break
             
     return all_ops
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Fetch Pi lockup statistics.")
+def main():
+    parser = argparse.ArgumentParser(description="Fetch Pi lockup statistics in parallel by day.")
     parser.add_argument("-d", "--days", type=int, default=1, help="Number of days to fetch data for (default: 1)")
     args = parser.parse_args()
 
     address = "GABT7EMPGNCQSZM22DIYC4FNKHUVJTXITUF6Y5HNIWPU4GA7BHT4GC5G"
-    print(f"Fetching data for the last {args.days} day(s) for Pi lockup account: {address}")
+    print(f"Parallelizing data fetch for the last {args.days} day(s) for account: {address}")
     
-    ops = fetch_data_for_days(address, args.days)
+    # 1. Determine boundaries
+    print("Determining day boundaries...")
+    try:
+        latest = get_latest_ledger()
+    except Exception as e:
+        print(f"Failed to fetch latest ledger: {e}")
+        return
+
+    now_ts = latest['closed_at']
+    boundaries = [None] # B0 = latest
+    for i in range(1, args.days + 1):
+        target_ts = now_ts - (i * DAY_SEC)
+        cursor = get_ledger_boundary_cursor(target_ts, latest)
+        boundaries.append(cursor)
     
+    # 2. Dispatch threads
+    # Limit max threads to something reasonable, e.g., 10 or the number of days.
+    max_workers = min(args.days, 10)
+    all_fetched_ops = []
+    
+    print(f"Starting {max_workers} worker threads...")
+    start_time = time.time()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for i in range(args.days):
+            start_cursor = boundaries[i]
+            end_cursor = boundaries[i+1]
+            futures.append(executor.submit(fetch_data_chunk, address, start_cursor, end_cursor))
+            
+        for future in as_completed(futures):
+            all_fetched_ops.extend(future.result())
+    
+    duration = time.time() - start_time
+    print(f"Fetched {len(all_fetched_ops)} operations in {duration:.2f} seconds.")
+
+    # 3. Process results
     buckets_data = {
         "Unlocked": {"wallets": set(), "amount": 0.0},
         "2 Weeks": {"wallets": set(), "amount": 0.0},
@@ -148,8 +197,7 @@ if __name__ == "__main__":
     }
     
     total_amount = 0.0
-    
-    for op in ops:
+    for op in all_fetched_ops:
         parsed = parse_operation(op)
         if parsed:
             bucket_name = get_bucket(parsed['duration'])
@@ -158,15 +206,18 @@ if __name__ == "__main__":
             buckets_data[bucket_name]['amount'] += parsed['amount']
             total_amount += parsed['amount']
 
+    # 4. Print summary
     print(f"\nSummary (Last {args.days} days):")
     print(f"{'Bucket':<15} | {'Wallets':<10} | {'Total Pi':<15} | {'% of Total'}")
     print("-" * 60)
     
     ordered_buckets = ["Unlocked", "2 Weeks", "6 Months", "1 Year", "3 Year"]
-    
     for name in ordered_buckets:
         data = buckets_data[name]
         wallet_count = len(data['wallets'])
         amount = data['amount']
         pct = (amount / total_amount * 100) if total_amount > 0 else 0
         print(f"{name:<15} | {wallet_count:<10} | {amount:<15.2f} | {pct:>10.2f}%")
+
+if __name__ == "__main__":
+    main()
