@@ -211,6 +211,8 @@ def main():
 
     # 4. Print summary
     print(f"\nSummary (Last {args.days} days):")
+    print(f"Total Wallets: {total_wallets_sum:,} | Total Pi: {total_amount:,.2f}")
+    print("-" * 75)
     print(f"{'Bucket':<15} | {'Wallets':<10} | {'Wallet %':<10} | {'Total Pi':<15} | {'Pi %'}")
     print("-" * 75)
     
